@@ -1,0 +1,14 @@
+---
+- name: Check MariaDB service
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Check mariadb active state
+      ansible.builtin.shell: systemctl is-active mariadb
+      register: mariadb_state
+      changed_when: false
+
+    - name: Show mariadb state
+      ansible.builtin.debug:
+        var: mariadb_state.stdout
