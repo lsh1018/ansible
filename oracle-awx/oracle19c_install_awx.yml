@@ -21,7 +21,8 @@
     oracle_ru_version: "19.22"
     oracle_linux_distid: "OL7"
     oracle_software_zip: ""
-    oracle_ru_patch_dir: ""
+    oracle_ru_patch_zip: ""
+    oracle_ru_patch_extract_dir: "{{ oracle_install_staging_dir }}/ru_patch"
     oracle_opatch_zip: ""
     oracle_required_packages_el8:
       - bc
@@ -104,8 +105,8 @@
       ansible.builtin.assert:
         that:
           - oracle_software_zip | length > 0
-          - oracle_ru_patch_dir | length > 0
-        fail_msg: oracle_software_zip and oracle_ru_patch_dir must be provided.
+          - oracle_ru_patch_zip | length > 0
+        fail_msg: oracle_software_zip and oracle_ru_patch_zip must be provided.
 
     - name: Validate RU version for EL8
       ansible.builtin.assert:
@@ -180,9 +181,9 @@
         path: "{{ oracle_software_zip }}"
       register: oracle_software_zip_stat
 
-    - name: Verify Oracle RU patch directory exists
+    - name: Verify Oracle RU patch zip exists
       ansible.builtin.stat:
-        path: "{{ oracle_ru_patch_dir }}"
+        path: "{{ oracle_ru_patch_zip }}"
       register: oracle_ru_patch_stat
 
     - name: Verify OPatch zip exists when provided
@@ -196,7 +197,7 @@
         that:
           - oracle_software_zip_stat.stat.exists
           - oracle_ru_patch_stat.stat.exists
-          - oracle_ru_patch_stat.stat.isdir
+          - oracle_ru_patch_stat.stat.isreg
           - oracle_opatch_zip | length == 0 or oracle_opatch_zip_stat.stat.exists
         fail_msg: One or more staged Oracle media paths do not exist on the target host.
 
@@ -332,6 +333,39 @@
         owner: "{{ oracle_install_user }}"
         group: "{{ oracle_dba_group }}"
       when: oracle_opatch_zip | length > 0
+
+    - name: Create RU patch extraction directory
+      ansible.builtin.file:
+        path: "{{ oracle_ru_patch_extract_dir }}"
+        state: directory
+        owner: "{{ oracle_install_user }}"
+        group: "{{ oracle_dba_group }}"
+        mode: "0775"
+
+    - name: Unarchive Oracle RU patch zip
+      ansible.builtin.unarchive:
+        src: "{{ oracle_ru_patch_zip }}"
+        dest: "{{ oracle_ru_patch_extract_dir }}"
+        remote_src: true
+        owner: "{{ oracle_install_user }}"
+        group: "{{ oracle_dba_group }}"
+
+    - name: Find extracted Oracle RU patch directory
+      ansible.builtin.find:
+        paths: "{{ oracle_ru_patch_extract_dir }}"
+        file_type: directory
+        recurse: false
+      register: oracle_ru_patch_dirs
+
+    - name: Validate extracted Oracle RU patch directory
+      ansible.builtin.assert:
+        that:
+          - oracle_ru_patch_dirs.matched >= 1
+        fail_msg: No extracted Oracle RU patch directory was found after unarchiving the DBRU zip.
+
+    - name: Set Oracle RU patch directory fact
+      ansible.builtin.set_fact:
+        oracle_ru_patch_dir: "{{ (oracle_ru_patch_dirs.files | map(attribute='path') | list | sort | first) }}"
 
     - name: Ensure Oracle base tree ownership
       ansible.builtin.file:

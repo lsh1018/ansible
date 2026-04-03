@@ -116,16 +116,18 @@ AWX 실행 전에 대상 서버 또는 공유 스토리지에 아래 파일을 s
 예시:
 
 ```yaml
-oracle_software_zip: "/stage/oracle/LINUX.X64_193000_db_home.zip"
-oracle_ru_patch_dir: "/stage/oracle/35943157"
-oracle_opatch_zip: "/stage/oracle/p6880880_190000_Linux-x86-64.zip"
+oracle_software_zip: "/oracle_install/LINUX.X64_193000_db_home.zip"
+oracle_ru_patch_zip: "/oracle_install/p37260974_190000_Linux-x86-64.zip"
+oracle_opatch_zip: "/oracle_install/p6880880_190000_Linux-x86-64.zip"
 ```
 
 설명:
 
 - `oracle_software_zip`: 19.3 database gold image zip
-- `oracle_ru_patch_dir`: unzip 된 DBRU 패치 디렉터리
+- `oracle_ru_patch_zip`: DBRU 패치 zip
 - `oracle_opatch_zip`: 최신 OPatch zip
+
+즉, 이제 DBRU는 미리 unzip 된 디렉터리를 준비할 필요 없이 zip 파일만 있으면 됩니다. playbook이 대상 서버에서 압축을 풀고, 추출된 patch directory를 찾아 `-applyRU`에 전달합니다.
 
 ## AWX 사용 방법
 
@@ -141,8 +143,8 @@ oracle_opatch_zip: "/stage/oracle/p6880880_190000_Linux-x86-64.zip"
 
 ```yaml
 oracle_ru_version: "19.18"
-oracle_software_zip: "/stage/oracle/LINUX.X64_193000_db_home.zip"
-oracle_ru_patch_dir: "/stage/oracle/34765931"
+oracle_software_zip: "/oracle_install/LINUX.X64_193000_db_home.zip"
+oracle_ru_patch_zip: "/oracle_install/p37260974_190000_Linux-x86-64.zip"
 oracle_selinux_mode: "permissive"
 ```
 
@@ -150,9 +152,9 @@ oracle_selinux_mode: "permissive"
 
 ```yaml
 oracle_ru_version: "19.22"
-oracle_software_zip: "/stage/oracle/LINUX.X64_193000_db_home.zip"
-oracle_ru_patch_dir: "/stage/oracle/35943157"
-oracle_opatch_zip: "/stage/oracle/p6880880_190000_Linux-x86-64.zip"
+oracle_software_zip: "/oracle_install/LINUX.X64_193000_db_home.zip"
+oracle_ru_patch_zip: "/oracle_install/p37260974_190000_Linux-x86-64.zip"
+oracle_opatch_zip: "/oracle_install/p6880880_190000_Linux-x86-64.zip"
 oracle_selinux_mode: "permissive"
 ```
 
@@ -170,7 +172,7 @@ oracle_selinux_mode: "permissive"
 oracle_disable_firewalld: true
 oracle_ru_version: "19.22"
 oracle_software_zip: ""
-oracle_ru_patch_dir: ""
+oracle_ru_patch_zip: ""
 oracle_opatch_zip: ""
 oracle_run_root_scripts: true
 oracle_runinstaller_ignore_prereq: false
@@ -186,10 +188,20 @@ oracle_runinstaller_ignore_prereq: false
 6. `oracle` 사용자와 `dba` 그룹 생성
 7. `/oracle`, `/oracle/ora19c`, `/oracle/oraInventory` 생성
 8. 19.3 gold image unzip
-9. 필요 시 OPatch 반영
-10. response file 생성
-11. `runInstaller -silent -applyRU` 실행
-12. `orainstRoot.sh`, `root.sh` 실행
+9. DBRU zip unzip 후 patch directory 자동 탐색
+10. 필요 시 OPatch 반영
+11. response file 생성
+12. `runInstaller -silent -applyRU` 실행
+13. `orainstRoot.sh`, `root.sh` 실행
+
+## zip 파일 권한 / 소유자 주의사항
+
+- `oracle_software_zip`, `oracle_ru_patch_zip`, `oracle_opatch_zip` 원본 파일의 소유자는 playbook이 변경하지 않습니다.
+- 현재 playbook은 `become: true`로 root 권한에서 `unarchive`를 수행하므로, 원본 zip 이 `root:root` 이어도 root 가 읽을 수 있으면 정상 처리됩니다.
+- 압축이 풀린 대상 경로(`/oracle/ora19c`, `/oracle/install/ru_patch` 등)는 `owner=oracle`, `group=dba` 로 맞춰집니다.
+- 즉, `oracle` 계정 생성이 원본 zip 파일의 권한을 자동으로 바꾸지는 않습니다.
+- 원본 zip 이 `0600 root:root` 여도 Ansible task 자체는 root 로 실행되므로 unzip 단계에는 문제가 없습니다.
+- 다만 설치 전에 사람이 `oracle` 계정으로 직접 해당 zip 파일을 열어야 하는 운영 절차가 있다면, 그때는 별도로 권한이나 그룹을 조정해야 합니다.
 
 ## 계정 / 그룹 정책
 
