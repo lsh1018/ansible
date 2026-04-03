@@ -1,0 +1,311 @@
+---
+- name: Install and bootstrap MariaDB Community Server with AWX on Ubuntu
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    mariadb_version: "11.8"
+    mariadb_supported_versions:
+      - "10.6"
+      - "10.11"
+      - "11.4"
+      - "11.8"
+      - "12.1"
+      - "12.2"
+    mariadb_packages:
+      - mariadb-server
+      - mariadb-client
+      - mariadb-backup
+    mariadb_repo_setup_url: "https://r.mariadb.com/downloads/mariadb_repo_setup"
+    mariadb_repo_setup_path: "/usr/local/bin/mariadb_repo_setup"
+    mariadb_repo_version_arg: "mariadb-{{ mariadb_version }}"
+    mariadb_socket_path: "/run/mysqld/mysqld.sock"
+    mariadb_bind_address: "127.0.0.1"
+    mariadb_remove_anonymous_users: true
+    mariadb_remove_test_database: true
+    mariadb_disallow_remote_root: true
+    mariadb_set_root_password: false
+    mariadb_root_password: ""
+    mariadb_write_root_client_cnf: false
+    mariadb_databases: []
+    mariadb_users: []
+
+  pre_tasks:
+    - name: Validate target OS
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_distribution_release in ["jammy", "noble"]
+        fail_msg: >-
+          This playbook supports Ubuntu 22.04 (jammy) and 24.04 (noble) only.
+
+    - name: Validate requested MariaDB version
+      ansible.builtin.assert:
+        that:
+          - mariadb_version in mariadb_supported_versions
+        fail_msg: >-
+          Supported MariaDB versions are {{ mariadb_supported_versions | join(', ') }}.
+          Versions 10.3 to 10.5 are intentionally excluded because they are old release series.
+
+    - name: Validate root password input
+      ansible.builtin.assert:
+        that:
+          - not mariadb_set_root_password or (mariadb_root_password | length > 0)
+        fail_msg: mariadb_root_password must be set when mariadb_set_root_password is true.
+
+    - name: Validate database definitions
+      ansible.builtin.assert:
+        that:
+          - item.name is defined
+          - item.name | length > 0
+        fail_msg: Each mariadb_databases entry must include a non-empty name.
+      loop: "{{ mariadb_databases }}"
+      loop_control:
+        label: "{{ item.name | default('undefined') }}"
+
+    - name: Validate user definitions
+      ansible.builtin.assert:
+        that:
+          - item.name is defined
+          - item.name | length > 0
+          - item.password is defined
+          - item.password | length > 0
+          - item.priv is defined
+          - item.priv | length > 0
+        fail_msg: Each mariadb_users entry must include name, password, and priv.
+      loop: "{{ mariadb_users }}"
+      loop_control:
+        label: "{{ item.name | default('undefined') }}"
+      no_log: true
+
+  tasks:
+    - name: Remove conflicting Ubuntu MySQL packages
+      ansible.builtin.apt:
+        name:
+          - mysql-server
+          - mysql-client
+          - mysql-common
+        state: absent
+        purge: true
+        autoremove: true
+      ignore_errors: true
+
+    - name: Install prerequisite packages
+      ansible.builtin.apt:
+        name:
+          - curl
+          - ca-certificates
+          - gnupg
+          - apt-transport-https
+        state: present
+        update_cache: true
+
+    - name: Download MariaDB repository setup script
+      ansible.builtin.get_url:
+        url: "{{ mariadb_repo_setup_url }}"
+        dest: "{{ mariadb_repo_setup_path }}"
+        mode: "0755"
+
+    - name: Configure MariaDB repository
+      ansible.builtin.command:
+        argv:
+          - bash
+          - "{{ mariadb_repo_setup_path }}"
+          - "--mariadb-server-version={{ mariadb_repo_version_arg }}"
+          - "--os-type=ubuntu"
+          - "--os-version={{ ansible_distribution_release }}"
+          - "--skip-maxscale"
+          - "--skip-tools"
+      register: mariadb_repo_setup
+      changed_when: false
+
+    - name: Refresh apt cache after repository setup
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install MariaDB packages
+      ansible.builtin.apt:
+        name: "{{ mariadb_packages }}"
+        state: present
+
+    - name: Configure MariaDB bind address
+      ansible.builtin.lineinfile:
+        path: /etc/mysql/mariadb.conf.d/50-server.cnf
+        regexp: '^\s*bind-address\s*='
+        line: "bind-address = {{ mariadb_bind_address }}"
+        backup: false
+      notify: Restart MariaDB
+
+    - name: Ensure MariaDB service is enabled and started
+      ansible.builtin.service:
+        name: mariadb
+        state: started
+        enabled: true
+
+    - name: Flush handlers before bootstrap
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for MariaDB socket
+      ansible.builtin.wait_for:
+        path: "{{ mariadb_socket_path }}"
+        state: present
+        timeout: 60
+
+    - name: Remove anonymous MariaDB users
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - --protocol=socket
+          - -uroot
+          - "--socket={{ mariadb_socket_path }}"
+          - -NBe
+          - |
+            SET @drop_users = (
+              SELECT GROUP_CONCAT(CONCAT('DROP USER IF EXISTS ''', User, '''@''', Host, '''') SEPARATOR '; ')
+              FROM mysql.user
+              WHERE User = ''
+            );
+            SET @drop_users = IFNULL(@drop_users, 'SELECT 1');
+            PREPARE stmt FROM @drop_users;
+            EXECUTE stmt;
+            DEALLOCATE PREPARE stmt;
+      when: mariadb_remove_anonymous_users
+      changed_when: false
+
+    - name: Remove test database
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - --protocol=socket
+          - -uroot
+          - "--socket={{ mariadb_socket_path }}"
+          - -NBe
+          - |
+            DROP DATABASE IF EXISTS test;
+            DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+            FLUSH PRIVILEGES;
+      when: mariadb_remove_test_database
+      changed_when: false
+
+    - name: Remove remote root accounts
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - --protocol=socket
+          - -uroot
+          - "--socket={{ mariadb_socket_path }}"
+          - -NBe
+          - |
+            SET @drop_users = (
+              SELECT GROUP_CONCAT(CONCAT('DROP USER IF EXISTS ''', User, '''@''', Host, '''') SEPARATOR '; ')
+              FROM mysql.user
+              WHERE User = 'root' AND Host NOT IN ('localhost', '127.0.0.1', '::1')
+            );
+            SET @drop_users = IFNULL(@drop_users, 'SELECT 1');
+            PREPARE stmt FROM @drop_users;
+            EXECUTE stmt;
+            DEALLOCATE PREPARE stmt;
+      when: mariadb_disallow_remote_root
+      changed_when: false
+
+    - name: Optionally set MariaDB root password
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - --protocol=socket
+          - -uroot
+          - "--socket={{ mariadb_socket_path }}"
+          - -NBe
+          - |
+            ALTER USER 'root'@'localhost' IDENTIFIED BY '{{ mariadb_root_password | replace("'", "''") }}';
+            FLUSH PRIVILEGES;
+      when: mariadb_set_root_password
+      no_log: true
+      changed_when: false
+
+    - name: Optionally write root client configuration
+      ansible.builtin.copy:
+        dest: /root/.my.cnf
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          [client]
+          user=root
+          password={{ mariadb_root_password }}
+          socket={{ mariadb_socket_path }}
+      when:
+        - mariadb_set_root_password
+        - mariadb_write_root_client_cnf
+      no_log: true
+
+    - name: Create application databases
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - --protocol=socket
+          - -uroot
+          - "--socket={{ mariadb_socket_path }}"
+          - -NBe
+          - >-
+            CREATE DATABASE IF NOT EXISTS `{{ item.name }}`
+            CHARACTER SET {{ item.charset | default('utf8mb4') }}
+            COLLATE {{ item.collation | default('utf8mb4_general_ci') }};
+      loop: "{{ mariadb_databases }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+
+    - name: Create or update MariaDB users
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - --protocol=socket
+          - -uroot
+          - "--socket={{ mariadb_socket_path }}"
+          - -NBe
+          - |
+            CREATE USER IF NOT EXISTS '{{ item.name | replace("'", "''") }}'@'{{ item.host | default("%") | replace("'", "''") }}' IDENTIFIED BY '{{ item.password | replace("'", "''") }}';
+            ALTER USER '{{ item.name | replace("'", "''") }}'@'{{ item.host | default("%") | replace("'", "''") }}' IDENTIFIED BY '{{ item.password | replace("'", "''") }}';
+      loop: "{{ mariadb_users }}"
+      loop_control:
+        label: "{{ item.name }}@{{ item.host | default('%') }}"
+      no_log: true
+      changed_when: false
+
+    - name: Grant privileges to MariaDB users
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - --protocol=socket
+          - -uroot
+          - "--socket={{ mariadb_socket_path }}"
+          - -NBe
+          - |
+            GRANT {{ item.priv.split(':', 2)[1] }} ON {{ item.priv.split(':', 2)[0] }} TO '{{ item.name | replace("'", "''") }}'@'{{ item.host | default("%") | replace("'", "''") }}';
+            FLUSH PRIVILEGES;
+      loop: "{{ mariadb_users }}"
+      loop_control:
+        label: "{{ item.name }} -> {{ item.priv }}"
+      no_log: true
+      changed_when: false
+
+    - name: Check installed MariaDB version
+      ansible.builtin.command: mysql --version
+      register: mariadb_version_output
+      changed_when: false
+
+    - name: Show configured repository result
+      ansible.builtin.debug:
+        var: mariadb_repo_setup.stdout_lines
+
+    - name: Show installed MariaDB version
+      ansible.builtin.debug:
+        var: mariadb_version_output.stdout
+
+  handlers:
+    - name: Restart MariaDB
+      ansible.builtin.service:
+        name: mariadb
+        state: restarted

@@ -1,0 +1,179 @@
+# MariaDB AWX Playbook
+
+Ubuntu Linux 서버에 AWX로 MariaDB Community Server를 자동 설치하고, 초기 운영 설정까지 한 번에 적용하기 위한 예제입니다.
+
+## 구성 파일
+
+- `mariadb_install_awx.yml`: AWX Job Template에서 사용할 MariaDB 설치 및 초기화 playbook
+
+## 지원 범위
+
+- OS: Ubuntu 22.04 `jammy`, Ubuntu 24.04 `noble`
+- 설치 방식: MariaDB 공식 APT 저장소 사용
+- 기본 버전: `11.8`
+- 기본 포함 작업:
+  - MariaDB 공식 저장소 구성
+  - `mariadb-server`, `mariadb-client`, `mariadb-backup` 설치
+  - 서비스 활성화 및 시작
+  - 익명 사용자 제거
+  - `test` DB 제거
+  - 원격 `root` 계정 제거
+  - 애플리케이션 DB / 사용자 생성
+
+## AWX 사용 방법
+
+1. AWX에서 Project를 현재 저장소로 연결
+2. Inventory와 Machine Credential 지정
+3. Job Template 생성
+4. Playbook으로 `mariadb-awx/mariadb_install_awx.yml` 선택
+5. Survey 또는 Extra Variables로 설치 버전과 초기 DB 정보를 입력
+
+## 기본 변수
+
+```yaml
+mariadb_version: "11.8"
+mariadb_bind_address: "127.0.0.1"
+mariadb_remove_anonymous_users: true
+mariadb_remove_test_database: true
+mariadb_disallow_remote_root: true
+mariadb_set_root_password: false
+mariadb_root_password: ""
+mariadb_write_root_client_cnf: false
+mariadb_packages:
+  - mariadb-server
+  - mariadb-client
+  - mariadb-backup
+mariadb_databases: []
+mariadb_users: []
+```
+
+## AWX Extra Variables 예시
+
+### 1. 기본 설치만 수행
+
+```yaml
+mariadb_version: "11.8"
+```
+
+### 2. DB와 서비스 계정까지 함께 생성
+
+```yaml
+mariadb_version: "11.8"
+mariadb_bind_address: "0.0.0.0"
+mariadb_databases:
+  - name: appdb
+    charset: utf8mb4
+    collation: utf8mb4_general_ci
+mariadb_users:
+  - name: appuser
+    password: "ChangeMe_Strong_123!"
+    host: "%"
+    priv: "appdb.*:ALL PRIVILEGES"
+```
+
+### 3. root 비밀번호까지 설정
+
+```yaml
+mariadb_version: "10.11"
+mariadb_set_root_password: true
+mariadb_root_password: "StrongRootPassword!"
+mariadb_write_root_client_cnf: true
+```
+
+## 권장 AWX Survey 항목
+
+- `mariadb_version`
+- `mariadb_bind_address`
+- `mariadb_set_root_password`
+- `mariadb_root_password`
+- `mariadb_databases`
+- `mariadb_users`
+
+실제 운영에서는 `mariadb_root_password`, 사용자 비밀번호는 AWX Credential 또는 encrypted extra vars로 관리하는 편이 안전합니다.
+
+## Playbook 동작 순서
+
+1. Ubuntu 배포판과 지원 버전 확인
+2. 설치 대상 MariaDB 버전 확인
+3. Ubuntu 기본 MySQL 패키지 제거
+4. 설치 전 필수 패키지 설치
+5. `mariadb_repo_setup` 다운로드 및 저장소 구성
+6. MariaDB 패키지 설치
+7. `bind-address` 반영
+8. MariaDB 서비스 시작
+9. 익명 사용자 / 테스트 DB / 원격 root 정리
+10. 선택적으로 root 비밀번호 설정
+11. 선택적으로 `/root/.my.cnf` 생성
+12. 애플리케이션 DB / 사용자 / 권한 생성
+
+## 버전별 패키지 설치 이슈 / 운영 메모
+
+### 1. 10.3 ~ 10.5 계열
+
+- 현재 MariaDB 저장소 설정 스크립트 기준 주요 지원 대상에 포함되지 않습니다.
+- old releases 계열이라 Ubuntu 22.04/24.04에서 자동화가 단순하지 않습니다.
+- 아카이브 저장소, 수동 repository pinning, 호환성 검토가 추가로 필요할 수 있습니다.
+- 따라서 이 playbook에서는 기본 지원 대상에서 제외했습니다.
+
+### 2. 10.6 계열
+
+- 레거시 이전 작업에는 여전히 의미가 있지만 신규 표준 버전으로 잡기에는 애매합니다.
+- 기존 애플리케이션 호환성이 우선일 때만 선택하는 편이 현실적입니다.
+
+### 3. 10.11 계열
+
+- 10.x 계열 중에서 운영 자동화에 가장 무난한 선택지입니다.
+- 기존 10.x 서비스와 버전 정렬이 필요할 때 우선 고려할 수 있습니다.
+
+### 4. 11.4 / 11.8 계열
+
+- 신규 구축 기본값으로 가장 무난합니다.
+- 운영 표준 버전을 정해야 한다면 먼저 검토할 만한 계열입니다.
+
+### 5. 12.1 / 12.2 계열
+
+- 최신 기능 반영에는 유리하지만 운영 반영 전 검증 범위를 더 넓게 잡는 편이 좋습니다.
+- 앱 드라이버, ORM, 백업 스크립트, 복제 구성을 미리 확인해야 합니다.
+
+### 6. 특정 minor 버전 pinning
+
+- `11.8.5`처럼 minor 버전을 고정하려면 `mariadb-server` 하나만 맞추면 끝나지 않을 수 있습니다.
+- `mariadb-client`, `mariadb-server-core` 등 관련 패키지 버전도 함께 맞춰야 의존성 충돌을 피하기 쉽습니다.
+- 그래서 운영 자동화에서는 series 단위(`10.11`, `11.8`, `12.2`) 관리가 더 단순합니다.
+
+### 7. 메이저 업그레이드
+
+- `10.11`에서 `11.4`로 넘어갈 때는 저장소 기준 버전 자체를 다시 설정해야 합니다.
+- 메이저 업그레이드 전에는 백업, 애플리케이션 호환성, 설정값 diff, 쿼리 계획 변화를 별도 점검해야 합니다.
+
+### 8. root 인증 방식 이슈
+
+- 10.4 이상 Unix 계열에서는 `unix_socket` 기반 root 인증 동작을 자주 만나게 됩니다.
+- root 비밀번호를 강제로 설정하면 기존 운영 방식과 로그인 절차가 달라질 수 있습니다.
+- 그래서 이 playbook에서도 root 비밀번호 설정은 기본 비활성화 상태로 두었습니다.
+
+### 9. `bind-address` 이슈
+
+- 기본값은 `127.0.0.1`이라 로컬 접속만 허용됩니다.
+- AWX에서 원격 앱 서버 접속까지 함께 고려한다면 `0.0.0.0` 또는 서비스 네트워크 IP로 바꿔야 합니다.
+- 이 경우 방화벽과 허용 호스트 정책을 반드시 함께 설계해야 합니다.
+
+## 권장 운영 기준
+
+- 신규 구축 기본값: `11.8`
+- 기존 10.x 호환 우선: `10.11`
+- 최신 기능 검증 목적: `12.2`
+- `10.3 ~ 10.5`: 별도 검토 후 수동 대응 권장
+
+## 운영 분리 권장 사항
+
+현재 playbook은 설치와 초기 bootstrap까지 담당합니다.
+
+운영 환경에서는 아래 항목을 별도 playbook 또는 role로 분리하는 편이 관리에 유리합니다.
+
+- 방화벽 정책
+- MariaDB 설정 파일 상세 튜닝
+- 백업 정책
+- DB 스키마 배포
+- 사용자 회전 정책
+- 모니터링 및 알람
