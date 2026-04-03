@@ -1,7 +1,7 @@
 ---
 - name: Check MariaDB service
-  hosts: dbservers
-  become: true
+  hosts: all
+  gather_facts: false
 
   tasks:
     - name: Check mariadb active state
