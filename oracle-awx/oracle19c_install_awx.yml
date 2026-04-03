@@ -1,0 +1,418 @@
+---
+- name: Install Oracle Database 19c software with AWX on RHEL and Rocky
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    oracle_base: "/oracle"
+    oracle_home: "/oracle/ora19c"
+    oracle_inventory_dir: "/oracle/oraInventory"
+    oracle_install_staging_dir: "/oracle/install"
+    oracle_rsp_file: "/oracle/install/db_install.rsp"
+    oracle_install_user: "oracle"
+    oracle_install_group: "oinstall"
+    oracle_dba_group: "dba"
+    oracle_oper_group: "oper"
+    oracle_backupdba_group: "backupdba"
+    oracle_dgdba_group: "dgdba"
+    oracle_kmdba_group: "kmdba"
+    oracle_racdba_group: "racdba"
+    oracle_edition: "EE"
+    oracle_selinux_mode: "permissive"
+    oracle_disable_firewalld: true
+    oracle_run_root_scripts: true
+    oracle_runinstaller_ignore_prereq: false
+    oracle_ru_version: "19.22"
+    oracle_linux_distid: "OL7"
+    oracle_software_zip: ""
+    oracle_ru_patch_dir: ""
+    oracle_opatch_zip: ""
+    oracle_required_packages_el8:
+      - bc
+      - binutils
+      - compat-openssl10
+      - elfutils-libelf
+      - elfutils-libelf-devel
+      - glibc
+      - glibc-devel
+      - ksh
+      - libaio
+      - libaio-devel
+      - libXrender
+      - libX11
+      - libXau
+      - libXi
+      - libXtst
+      - libgcc
+      - libnsl
+      - librdmacm
+      - libstdc++
+      - libstdc++-devel
+      - libxcb
+      - libibverbs
+      - make
+      - policycoreutils
+      - policycoreutils-python-utils
+      - smartmontools
+      - sysstat
+      - unzip
+    oracle_required_packages_el9:
+      - bc
+      - binutils
+      - compat-openssl11
+      - elfutils-libelf
+      - fontconfig
+      - glibc
+      - glibc-devel
+      - ksh
+      - libaio
+      - libasan
+      - liblsan
+      - libX11
+      - libXau
+      - libXi
+      - libXrender
+      - libXtst
+      - libxcrypt-compat
+      - libgcc
+      - libibverbs
+      - libnsl
+      - librdmacm
+      - libstdc++
+      - libxcb
+      - libvirt-libs
+      - make
+      - policycoreutils
+      - policycoreutils-python-utils
+      - smartmontools
+      - sysstat
+      - unzip
+
+  pre_tasks:
+    - name: Validate supported distributions
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family == "RedHat"
+          - ansible_distribution in ["RedHat", "Rocky"]
+          - ansible_distribution_major_version in ["8", "9"]
+        fail_msg: This playbook supports Red Hat Enterprise Linux and Rocky Linux 8.x or 9.x only.
+
+    - name: Validate Oracle home layout
+      ansible.builtin.assert:
+        that:
+          - oracle_base == "/oracle"
+          - oracle_home == "/oracle/ora19c"
+        fail_msg: This playbook is intentionally fixed to ORACLE_BASE=/oracle and ORACLE_HOME=/oracle/ora19c.
+
+    - name: Validate software zip input
+      ansible.builtin.assert:
+        that:
+          - oracle_software_zip | length > 0
+          - oracle_ru_patch_dir | length > 0
+        fail_msg: oracle_software_zip and oracle_ru_patch_dir must be provided.
+
+    - name: Validate RU version for EL8
+      ansible.builtin.assert:
+        that:
+          - oracle_ru_version is version('19.18', '>=')
+        fail_msg: RHEL/Rocky 8 requires Oracle 19c RU 19.18 or later for this automation flow.
+      when: ansible_distribution_major_version == "8"
+
+    - name: Validate RU version for EL9
+      ansible.builtin.assert:
+        that:
+          - oracle_ru_version is version('19.19', '>=')
+        fail_msg: RHEL/Rocky 9 requires Oracle 19c RU 19.19 or later.
+      when: ansible_distribution_major_version == "9"
+
+    - name: Validate OPatch input for EL9
+      ansible.builtin.assert:
+        that:
+          - oracle_opatch_zip | length > 0
+        fail_msg: oracle_opatch_zip must be provided for RHEL/Rocky 9 installs.
+      when: ansible_distribution_major_version == "9"
+
+    - name: Gather service facts
+      ansible.builtin.service_facts:
+
+    - name: Check /tmp free space
+      ansible.builtin.command: df -Pm /tmp
+      register: oracle_tmp_df
+      changed_when: false
+
+    - name: Set /tmp free space fact
+      ansible.builtin.set_fact:
+        oracle_tmp_free_mb: "{{ oracle_tmp_df.stdout_lines[1].split()[3] | int }}"
+
+    - name: Check minimum /tmp free space
+      ansible.builtin.assert:
+        that:
+          - oracle_tmp_free_mb >= 1024
+        fail_msg: /tmp must have at least 1024 MB free space.
+
+    - name: Set Oracle memory requirement facts
+      ansible.builtin.set_fact:
+        oracle_ram_mb: "{{ ansible_memory_mb.real.total | int }}"
+        oracle_swap_mb: "{{ ansible_memory_mb.swap.total | int }}"
+        oracle_required_swap_mb: >-
+          {% set ram = ansible_memory_mb.real.total | int %}
+          {% if ram < 2048 %}
+          {{ ((ram * 1.5) | round(0, 'ceil')) | int }}
+          {% elif ram <= 16384 %}
+          {{ ram }}
+          {% else %}
+          16384
+          {% endif %}
+        oracle_shmmax_bytes: "{{ ((ansible_memory_mb.real.total | int) * 1024 * 1024 / 2) | int }}"
+        oracle_shmall_pages: "{{ (((ansible_memory_mb.real.total | int) * 1024 * 1024 / 2) / 4096) | round(0, 'ceil') | int }}"
+
+    - name: Validate minimum RAM
+      ansible.builtin.assert:
+        that:
+          - oracle_ram_mb >= 1024
+        fail_msg: Oracle Database installation requires at least 1024 MB RAM.
+
+    - name: Validate swap size
+      ansible.builtin.assert:
+        that:
+          - oracle_swap_mb >= (oracle_required_swap_mb | int)
+        fail_msg: >-
+          Current swap is {{ oracle_swap_mb }} MB, but at least {{ oracle_required_swap_mb }} MB is required.
+
+    - name: Verify Oracle software zip exists
+      ansible.builtin.stat:
+        path: "{{ oracle_software_zip }}"
+      register: oracle_software_zip_stat
+
+    - name: Verify Oracle RU patch directory exists
+      ansible.builtin.stat:
+        path: "{{ oracle_ru_patch_dir }}"
+      register: oracle_ru_patch_stat
+
+    - name: Verify OPatch zip exists when provided
+      ansible.builtin.stat:
+        path: "{{ oracle_opatch_zip }}"
+      register: oracle_opatch_zip_stat
+      when: oracle_opatch_zip | length > 0
+
+    - name: Validate staged installation media
+      ansible.builtin.assert:
+        that:
+          - oracle_software_zip_stat.stat.exists
+          - oracle_ru_patch_stat.stat.exists
+          - oracle_ru_patch_stat.stat.isdir
+          - oracle_opatch_zip | length == 0 or oracle_opatch_zip_stat.stat.exists
+        fail_msg: One or more staged Oracle media paths do not exist on the target host.
+
+  tasks:
+    - name: Set package list for current OS major version
+      ansible.builtin.set_fact:
+        oracle_required_packages: "{{ oracle_required_packages_el8 if ansible_distribution_major_version == '8' else oracle_required_packages_el9 }}"
+
+    - name: Install required OS packages
+      ansible.builtin.package:
+        name: "{{ oracle_required_packages }}"
+        state: present
+
+    - name: Set SELinux configuration
+      ansible.builtin.lineinfile:
+        path: /etc/selinux/config
+        regexp: '^SELINUX='
+        line: "SELINUX={{ oracle_selinux_mode }}"
+        create: false
+      when: oracle_selinux_mode in ["permissive", "disabled"]
+
+    - name: Set SELinux runtime to permissive when possible
+      ansible.builtin.command: setenforce 0
+      changed_when: false
+      failed_when: false
+      when:
+        - ansible_selinux is defined
+        - ansible_selinux.status == "enabled"
+        - ansible_selinux.mode == "enforcing"
+        - oracle_selinux_mode in ["permissive", "disabled"]
+
+    - name: Stop and disable firewalld
+      ansible.builtin.service:
+        name: firewalld
+        state: stopped
+        enabled: false
+      when:
+        - oracle_disable_firewalld
+        - "'firewalld.service' in ansible_facts.services"
+
+    - name: Create Oracle groups
+      ansible.builtin.group:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - "{{ oracle_install_group }}"
+        - "{{ oracle_dba_group }}"
+        - "{{ oracle_oper_group }}"
+        - "{{ oracle_backupdba_group }}"
+        - "{{ oracle_dgdba_group }}"
+        - "{{ oracle_kmdba_group }}"
+        - "{{ oracle_racdba_group }}"
+
+    - name: Create Oracle install user
+      ansible.builtin.user:
+        name: "{{ oracle_install_user }}"
+        group: "{{ oracle_install_group }}"
+        groups:
+          - "{{ oracle_dba_group }}"
+          - "{{ oracle_oper_group }}"
+          - "{{ oracle_backupdba_group }}"
+          - "{{ oracle_dgdba_group }}"
+          - "{{ oracle_kmdba_group }}"
+          - "{{ oracle_racdba_group }}"
+        append: true
+        create_home: true
+        shell: /bin/bash
+        state: present
+
+    - name: Create Oracle directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ oracle_base }}", owner: "{{ oracle_install_user }}", group: "{{ oracle_install_group }}", mode: "0775" }
+        - { path: "{{ oracle_home }}", owner: "{{ oracle_install_user }}", group: "{{ oracle_install_group }}", mode: "0775" }
+        - { path: "{{ oracle_inventory_dir }}", owner: "{{ oracle_install_user }}", group: "{{ oracle_install_group }}", mode: "0775" }
+        - { path: "{{ oracle_install_staging_dir }}", owner: "{{ oracle_install_user }}", group: "{{ oracle_install_group }}", mode: "0775" }
+
+    - name: Configure Oracle kernel parameters
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-oracle-19c.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          fs.file-max = 6815744
+          fs.aio-max-nr = 1048576
+          kernel.sem = 250 32000 100 128
+          kernel.shmmni = 4096
+          kernel.shmmax = {{ oracle_shmmax_bytes }}
+          kernel.shmall = {{ oracle_shmall_pages }}
+          kernel.panic_on_oops = 1
+          net.ipv4.ip_local_port_range = 9000 65500
+          net.core.rmem_default = 262144
+          net.core.rmem_max = 4194304
+          net.core.wmem_default = 262144
+          net.core.wmem_max = 1048576
+      notify: Apply sysctl settings
+
+    - name: Configure Oracle security limits
+      ansible.builtin.copy:
+        dest: /etc/security/limits.d/oracle-19c.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {{ oracle_install_user }} soft nofile 1024
+          {{ oracle_install_user }} hard nofile 65536
+          {{ oracle_install_user }} soft nproc 2047
+          {{ oracle_install_user }} hard nproc 16384
+          {{ oracle_install_user }} soft stack 10240
+          {{ oracle_install_user }} hard stack 32768
+          {{ oracle_install_user }} soft memlock 3145728
+          {{ oracle_install_user }} hard memlock 3145728
+
+    - name: Configure Oracle user environment
+      ansible.builtin.blockinfile:
+        path: "/home/{{ oracle_install_user }}/.bash_profile"
+        create: true
+        owner: "{{ oracle_install_user }}"
+        group: "{{ oracle_install_group }}"
+        mode: "0644"
+        marker: "# {mark} ANSIBLE ORACLE 19C"
+        block: |
+          export ORACLE_BASE={{ oracle_base }}
+          export ORACLE_HOME={{ oracle_home }}
+          export ORACLE_SID=${ORACLE_SID:-ORCLCDB}
+          export PATH=${ORACLE_HOME}/bin:${PATH}
+
+    - name: Unarchive Oracle 19c software image
+      ansible.builtin.unarchive:
+        src: "{{ oracle_software_zip }}"
+        dest: "{{ oracle_home }}"
+        remote_src: true
+        owner: "{{ oracle_install_user }}"
+        group: "{{ oracle_install_group }}"
+        creates: "{{ oracle_home }}/runInstaller"
+
+    - name: Unarchive OPatch when provided
+      ansible.builtin.unarchive:
+        src: "{{ oracle_opatch_zip }}"
+        dest: "{{ oracle_home }}"
+        remote_src: true
+        owner: "{{ oracle_install_user }}"
+        group: "{{ oracle_install_group }}"
+      when: oracle_opatch_zip | length > 0
+
+    - name: Create Oracle response file
+      ansible.builtin.copy:
+        dest: "{{ oracle_rsp_file }}"
+        owner: "{{ oracle_install_user }}"
+        group: "{{ oracle_install_group }}"
+        mode: "0600"
+        content: |
+          oracle.install.responseFileVersion=/oracle/install/rspfmt_dbinstall_response_schema_v19.0.0
+          oracle.install.option=INSTALL_DB_SWONLY
+          UNIX_GROUP_NAME={{ oracle_install_group }}
+          INVENTORY_LOCATION={{ oracle_inventory_dir }}
+          ORACLE_BASE={{ oracle_base }}
+          ORACLE_HOME={{ oracle_home }}
+          oracle.install.db.InstallEdition={{ oracle_edition }}
+          oracle.install.db.OSDBA_GROUP={{ oracle_dba_group }}
+          oracle.install.db.OSOPER_GROUP={{ oracle_oper_group }}
+          oracle.install.db.OSBACKUPDBA_GROUP={{ oracle_backupdba_group }}
+          oracle.install.db.OSDGDBA_GROUP={{ oracle_dgdba_group }}
+          oracle.install.db.OSKMDBA_GROUP={{ oracle_kmdba_group }}
+          oracle.install.db.OSRACDBA_GROUP={{ oracle_racdba_group }}
+          SECURITY_UPDATES_VIA_MYORACLESUPPORT=false
+          DECLINE_SECURITY_UPDATES=true
+
+    - name: Run Oracle installer in silent mode
+      ansible.builtin.command:
+        cmd: >-
+          {{ oracle_home }}/runInstaller
+          -silent
+          -waitforcompletion
+          -responseFile {{ oracle_rsp_file }}
+          -applyRU {{ oracle_ru_patch_dir }}
+          {% if oracle_runinstaller_ignore_prereq %}-ignorePrereqFailure{% endif %}
+      become_user: "{{ oracle_install_user }}"
+      environment:
+        ORACLE_BASE: "{{ oracle_base }}"
+        ORACLE_HOME: "{{ oracle_home }}"
+        CV_ASSUME_DISTID: "{{ oracle_linux_distid }}"
+      register: oracle_install_result
+      changed_when: true
+      args:
+        creates: "{{ oracle_home }}/bin/sqlplus"
+
+    - name: Run Oracle inventory root script
+      ansible.builtin.command: "{{ oracle_inventory_dir }}/orainstRoot.sh"
+      when:
+        - oracle_run_root_scripts
+        - oracle_install_result is succeeded
+
+    - name: Run Oracle home root script
+      ansible.builtin.command: "{{ oracle_home }}/root.sh"
+      when:
+        - oracle_run_root_scripts
+        - oracle_install_result is succeeded
+
+    - name: Show installer summary
+      ansible.builtin.debug:
+        var: oracle_install_result.stdout_lines
+      when: oracle_install_result is defined
+
+  handlers:
+    - name: Apply sysctl settings
+      ansible.builtin.command: sysctl --system
+      changed_when: false
