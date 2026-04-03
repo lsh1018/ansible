@@ -5,10 +5,28 @@
 
   tasks:
     - name: Check mariadb active state
-      ansible.builtin.raw: systemctl is-active mariadb
+      ansible.builtin.shell: systemctl is-active mariadb
       register: mariadb_state
+      changed_when: false
+
+    - name: Check 3306 listen
+      ansible.builtin.shell: ss -lntp | grep 3306
+      register: mariadb_port
       changed_when: false
 
     - name: Show mariadb state
       ansible.builtin.debug:
         var: mariadb_state.stdout
+
+    - name: Show mariadb port
+      ansible.builtin.debug:
+        var: mariadb_port.stdout_lines
+
+    - name: Check version
+      ansible.builtin.shell: mysql --version
+      register: mariadb_version
+      changed_when: false
+
+    - name: Show version
+      ansible.builtin.debug:
+        var: mariadb_version.stdout
